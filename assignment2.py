@@ -378,8 +378,371 @@ def view_trajectory(positions, box_size=None, speed_modes=None):
 ############ PREDEFINED HELPER FUNCTIONS: DO NOT EDIT ##############
 
 ############ INSERT YOUR FUNCTIONS HERE ##############
+def initGrid(L, nPart, dim):
+    '''
+    function to determine particle positions and box size for a specified number of particles and density
 
-# def initGrid():
-#     returns initial configuration
+    Start at the empty array coords in which we will place the coordinates of the particles.
+    Create an additional variable called L which shall give the box dimension (float).
+    Make sure to shift the coordinates to have (0,0,0) as the center of the box.
+
+    Fill the box with particles without overlap and correct density
+
+    You can check the positioning of particles using a scatter plot
+    import matplotlib.pyplot as plt
+    plt.figure()
+    plt.scatter(x, y)
+    plt.show()
+
+    :param L: box dimension [Ang]
+    :param rho: density of particles [number per unit length]
+
+    :return: coordinates centered around origin [Ang]
+    :return: box size [Ang]
+    '''
+    if dim == 1:
+        # 1D case
+        n_axis = nPart
+        spac   = L / n_axis
+
+        coords = np.zeros((nPart, 1))
+        for i in range(nPart):
+            coords[i, 0] = i * spac
+
+        # centering part by substracting half extent to the coordinates
+        half_extent = (n_axis - 1) / 2 * spac
+        coords_centered = coords - half_extent
+        return coords_centered, L
+
+    elif dim == 2:
+        #2D case
+        n_axis = int(math.ceil(nPart**(1/2))) 
+        spac   = L / n_axis
+        coords = np.zeros((nPart, 2))
+        count  = 0
+
+        for i in range(n_axis):
+            for j in range(n_axis):
+                if count >= nPart:
+                    break
+                coords[count, 0] = i * spac
+                coords[count, 1] = j * spac
+                count += 1
+            if count >= nPart:
+                break
+
+        
+        half_extent = (n_axis - 1) / 2 * spac
+        coords_centered = coords - half_extent
+        return coords_centered, L
+
+    elif dim == 3:
+        # In 3D
+        n_axis = int(math.ceil(nPart**(1/3)))
+        spac   = L / n_axis
+        coords = np.zeros((nPart, 3))
+        count  = 0
+
+        for i in range(n_axis):
+            for j in range(n_axis):
+                for k in range(n_axis):
+                    if count >= nPart:
+                        break
+                    coords[count, 0] = i * spac
+                    coords[count, 1] = j * spac
+                    coords[count, 2] = k * spac
+                    count += 1
+                if count >= nPart:
+                    break
+            if count >= nPart:
+                break
+
+        
+        half_extent = (n_axis - 1) / 2 * spac #center by subtracting half extent to te coordinates
+        coords_centered = coords - half_extent
+        return coords_centered, L
+
+    else:
+        raise ValueError("dim must be 1, 2, or 3.")
+    
+def initVel(nPart, T, dim, m):
+    ''' 
+    Inputs: nPart, T in Kelvin, dim and m in g/mol
+    output: velocity in (Å/fs)
+    
+    '''
+
+   
+    kB_md = sc.Boltzmann * sc.Avogadro /1000  # boltzmann in  kJ/(mol K)
+    
+    sigma = np.sqrt(kB_md * T / m) #calculate the standard deviation for the velocity distribution in m/s
+
+    if dim == 1:
+        # 1D case
+        velocities = np.random.normal(0, sigma, nPart)
+        
+
+    elif dim == 2:
+        # 2D case
+        velocities = np.random.normal(0, sigma, (nPart, 2))
+        
+
+    elif dim == 3:
+        # 3D case
+        velocities = np.random.normal(0, sigma, (nPart, 3))
+        
+
+    else:
+        raise ValueError("dim must be 1, 2, or 3.")
+    
+    v_cm = np.mean(velocities, axis=0)
+    velocities = velocities - v_cm  # Remove center of mass velocity to avoid drift
+    
+    
+    KE_actual = 0.5 * (m/1000) * np.mean(np.sum(velocities**2, axis=1)) # Calculate actual kinetic energy in kJ/mol
+    KE_target = 0.5 * dim * kB_md * T # calculate target kinetic energy in kJ/mol
+    scaling = np.sqrt(KE_target / KE_actual) #calculate scaling factor to match target kinetic energy
+    velocities = velocities * scaling  # Scale velocities to match target kinetic energy
+
+    velocities_MD = velocities *1e-5 #convert velocities in A/fs
+    #for debugging purposes calculate final temperature
+    T_final = ((m/1000) * np.mean(np.sum(velocities**2, axis=1))) / (dim * kB_md)
+    print("Final temperature:", T_final," K")
+
+
+    return velocities_MD
+
+def distances (pos, Lbox):
+    
+    dr = np.zeros((pos.shape[0], pos.shape[0], pos.shape[1])) #initialize the distance array
+    r = np.zeros((pos.shape[0], pos.shape[0])) #initialize the distance matrix
+    dr =  pos[:, np.newaxis, :] - pos[np.newaxis, :, :] #calculating the distance between the particles in a vectorized form by using the broadcasting feature of numpy
+    dr = dr - Lbox * np.round(dr / Lbox) #apply periodic boundary conditions
+    r = np.sqrt(np.sum(dr**2,axis=2)) #module of the distance
+
+    return dr, r
+def LJ_forces (pos,Lbox, Rcut, epsilon, sigma):
+    """
+    Units: pos, Lbox, sigma, Rcut all in Angstroms; epsilon in kJ/mol.
+    Returns F  in kJ/mol * Angstroms (perfect for m = g/mol and time units in fs).
+    """
+    
+    dr = np.zeros((pos.shape[0], pos.shape[0], pos.shape[1])) #initialize the distance array
+    r = np.zeros((pos.shape[0], pos.shape[0])) #initialize the distance matrix
+    N = pos.shape[0]  # calculate number of particles
+    dim = pos.shape[1]
+    F=np.zeros(pos.shape)
+    dr, r = distances(pos, Lbox)
+    
+    mask = (r < Rcut) & (r > 1e-14) & np.triu(np.ones((N, N), dtype=bool), k=1) #condition where the Lennard-Jones potential is calculated, added condition to avoid division by zero and to avoid double counting
+    
+    r_accepted = r[mask]
+    
+    F_scal = (24 * epsilon * (2 * sigma**12 / r_accepted**13 - sigma**6 / r_accepted**7)) # derivative of the Lennard-Jones potential
+    
+    F_vec = (F_scal / r_accepted)[:, None] * dr[mask] # python broadcasting function to get vector with shape: (N, N, dim)
+    
+    #loop to apply Newtons law
+    pairs = np.array(np.where(mask)).T  #  get list of (i, j) index pairs for which the force is computed by using transpose
+
+    for k, (i, j) in enumerate(pairs): #loop for getting F vector
+        # Apply equal and opposite forces to particle i and j (using Newton's third law)
+        F[i] = F[i]+ F_vec[k]
+        F[j] = F[j]- F_vec[k]
+    
+    return F
+
+def velocityVerlet(pos, vel, F, dt, mass, Lbox, Rcut, epsilon, sigma):
+    ''' pos, Lbox, Rcut,Sigma in angstroms, vel in angstrom/fs, F in kJ/mol *angstroms, dt in fs, mass in g/mol,'''
+    
+  
+    
+    mass = mass / 1000 #convert it back in kg/mol
+    
+    pos = pos + vel *dt + 1/(2*mass) *F* 1000*(1e10/1e15)**2 *dt**2 #calculate new position in Angstrom
+    
+    pos = pos - Lbox * np.round(pos / Lbox) #apply periodic boundary condition
+    
+    vel_dthalf = vel + 0.5* F* 1000*(1e10/1e15)**2/mass *dt #updated velocity after half timestep
+    
+    F_new = LJ_forces(pos, Lbox, Rcut, epsilon, sigma) #calculate the new LJ force
+    
+    vel = vel_dthalf + 0.5 * (F_new)* 1000*(1e10/1e15)**2 /mass * dt # update the velocity
+    
+    return vel, pos, F_new
+
+def kineticEnergy(vel, mass):
+    '''Converts velocity from Ang/fs in m/s and mass from g/mol to kg/mol and gives kinetic energy back in kJ/mol'''
+    conv = (1e-10 / 1e-15)**2  # conversion: (Angstroms/fs)^2 -> m^2/s^2
+    mass = mass /1000 #convert mass in kg/mol
+    KE_J_per_mol = 0.5 * mass * np.sum(vel**2 * conv)  # calculate kinetic energy in J/mol
+    return KE_J_per_mol / 1000  # kJ/mol
+
+def potentialEnergy(pos, Lbox, Rcut, epsilon, sigma):
+    ''' pos, Lbox, Rcut and sigma in Angstroms and epsilon in kJ/mol'''
+    dr = np.zeros((pos.shape[0], pos.shape[0], pos.shape[1])) #initialize the distance array
+    r = np.zeros((pos.shape[0], pos.shape[0])) #initialize the distance matrix
+    N = pos.shape[0]  # calculate number of particles
+   
+    dr, r = distances(pos, Lbox)
+    
+    mask = (r < Rcut) & (r > 1e-14) & np.triu(np.ones((N, N), dtype=bool), k=1) #condition where the Lennard-Jones potential is calculated, added condition to avoid division by zero and to avoid double counting
+    
+    r_accepted = r[mask]
+    energy = 4 * epsilon * ((sigma / r_accepted) ** 12 - (sigma / r_accepted) ** 6)  # calculate the Lennard-Jones potential
+
+    return energy.sum()  # return the total potential energy
+
+def temperature(KE, N, dim): #calculate temperature from kinetic energy (formula from lecture 7 slide 26)
+    '''Kinetic energy in kJ/mol, returns temp in K'''
+    kB_md = sc.Boltzmann * sc.Avogadro / 1000 # kJ/(mol·K)
+    return (2 * KE) / (N* dim * kB_md)  # calculate temperature from kinetic energy
+
+
+def pressure(pos, vel, mass, Lbox, Rcut, epsilon, sigma):
+    '''pos, Lbox, Rcut and sigma in angstroms, vel in ang/fs, epsilon in kJ/mol, mass in g/mol'''
+    
+    dr = np.zeros((pos.shape[0], pos.shape[0], pos.shape[1])) #initialize the distance array
+    r = np.zeros((pos.shape[0], pos.shape[0])) #initialize the distance matrix
+    N = pos.shape[0]  # number of particles
+    V = Lbox ** 3
+    
+    kB_md = sc.Boltzmann * sc.Avogadro / 1000
+    dim = pos.shape[1]  # number of dimensions
+    dr, r = distances(pos, Lbox)  # calculate distances between particles
+    mask = (r < Rcut) & (r > 1e-14) & np.triu(np.ones((N, N), dtype=bool), k=1) #condition where the Lennard-Jones potential is calculated, added condition to avoid division by zero and to avoid double counting
+    
+    r_accepted = r[mask]
+    
+    F_scal = (24 * epsilon * (2 * sigma**12 / r_accepted**13 - sigma**6 / r_accepted**7)) # derivative of the Lennard-Jones potential
+    
+    F_vec    = (F_scal / r_accepted)[:,None] * dr[mask] # python broadcasting function to get vector with shape: (N, N, dim)
+    r_vec = dr[mask]  # extract corresponding distance vectors for the accepted pairs
+    KE = kineticEnergy(vel, mass)  # calculate kinetic energy
+    T = temperature(KE, N, dim) #calculate temperature from kinetic energy
+    P = N * kB_md * T / V +  1/(6*V) * np.sum(np.einsum('ij,ij->i',F_vec, r_vec))  # calculate pressure using the virial theorem
+    P_MPa = P * (1e27/sc.Avogadro) # convert pressure to MPa
+   
+
+    return P_MPa  # return pressure in MPa
+
+
+
+def MDSolve (pos, vel, mass, Lbox, Rcut, epsilon, sigma,dt, steps, sample_freq, log_file, traj_file): #function to solve the molecular dynamics case
+    step = 0  # initialize step counter
+    N = pos.shape[0]  # number of particles
+    dim = pos.shape[1]  # number of dimensions
+    
+
+        
+    F = LJ_forces(pos, Lbox, Rcut, epsilon, sigma) #calculate the initial forces using the Lennard-Jones potential
+ 
+ 
+    with open(log_file, 'w') as flog:  # open log file to write simulation data
+        flog.write('Step    T(K)      KE(kJ)        PE(kJ)       TotE(kJ)\n')
+        
+    open(traj_file, 'w').close()    
+
+    for step in range(steps):
+            
+            vel, pos, F_new = velocityVerlet(pos, vel, F, dt, mass, Lbox, Rcut, epsilon, sigma) #update positions and velocities using the velocity Verlet algorithm after first time step
+            #pos = pos - Lbox * np.round(pos / Lbox)  # apply periodic boundary conditions
+            F = F_new
+           
+           
+            
+            if step % sample_freq == 0:
+                KE = kineticEnergy(vel, mass)  # calculate kinetic energy
+                P = pressure(pos, vel, mass, Lbox, Rcut, epsilon, sigma)  # calculate pressure
+                Upot = potentialEnergy(pos, Lbox, Rcut, epsilon, sigma)  # calculate potential energy
+                Tempi = temperature(KE, pos.shape[0], pos.shape[1])  # calculate temperature
+                print('%i %.12f %.12f %.12f %.12f' %(step, Tempi, KE, Upot, KE+Upot))
+                with open(log_file, 'a') as flog:
+                    flog.write(f"{step:6d} {Tempi:10.3f} {KE:12.5e} {Upot:12.5e} {Upot+KE:12.5e}\n") # write the data to the log file
+
+                write_frame(pos, Lbox, vel, F_new, traj_file, step)  # write the current frame to the trajectory file
+                                    
+                
+    return pos, vel, F  # return the final positions, velocities, and forces
+
+#define function to read log lamps film to read properly the file
+def read_log_lammps(filename):
+    with open(filename, 'r') as file:
+        lines = file.readlines()
+
+    data = []
+    start_reading = False
+    for line in lines:
+        if "Step" in line and "Temp" in line:
+            start_reading = True
+            continue
+        if start_reading:
+            if line.strip() == '' or line.startswith("Loop"):
+                break
+            parts = line.split()
+            if len(parts) == 6:
+                data.append([float(x) for x in parts])
+    
+    return np.array(data)
+
+def velocityVerletThermostat(pos, Lbox, vel,F,zeta,mass, dt,kbTemp,sigma,epsilon, Rcut, Q, nPart):
+
+    ''' pos, Lbox, Rcut,Sigma in angstroms, vel in angstrom/fs, F in kJ/mol *angstroms, dt in fs, mass in g/mol'''
+  
+    
+    
+    KE = kineticEnergy(vel, mass)  # calculate kinetic energy
+    mass_kg = mass / 1000  # convert mass to kg/mol for calculations
+    pos = pos + vel *dt + 0.5 *dt**2 *(F* 1000*(1e10/1e15)**2/mass_kg-zeta*vel)
+    zeta = zeta + 0.5* dt/Q * (KE-((3*nPart+1)/2) * kbTemp) #update the random force xi 
+    vel = vel + 0.5* dt * (F* 1000*(1e10/1e15)**2/mass_kg - zeta*vel) #update the velocity 
+    
+    F = LJ_forces(pos, Lbox, Rcut, epsilon, sigma) # update the forces using the Lennard-Jones potential
+    KE = kineticEnergy(vel, mass)  # recalculate kinetic energy after force update
+    
+    zeta = zeta + 0.5* dt/Q * (KE-((3*nPart+1)/2) * kbTemp) #update the random force xi again
+    vel = (vel + 0.5*dt * (F* 1000*(1e10/1e15)**2)/mass_kg)/(1 + 0.5*dt *zeta) #update the velocity again
+   
+
+    return pos, vel, F, zeta  # return updated positions, velocities, forces and random force
+
+def MDSolve_v2 (nPart,pos,T, vel, mass, Lbox, Rcut, epsilon, sigma,dt, steps, sample_freq,Q,zeta, log_file, traj_file): #function to solve the molecular dynamics case
+    step = 0  # initialize step counter
+    N = pos.shape[0]  # number of particles
+    dim = pos.shape[1]  # number of dimensions
+    kB_kJ = sc.Boltzmann * sc.Avogadro / 1000   #kJ/mol *K
+    kbTemp = kB_kJ * T       #kJ /mol
+
+        
+    F = LJ_forces(pos, Lbox, Rcut, epsilon, sigma) #calculate the initial forces using the Lennard-Jones potential
+ 
+ 
+    with open(log_file, 'w') as flog:  # open log file to write simulation data
+        flog.write('Step    T(K)    KE(kJ)    PE(kJ)    TotE(kJ)    P(MPa)\n')
+        
+    open(traj_file, 'w').close()    
+
+    for step in range(steps):
+            
+            pos,vel, F_new, zeta = velocityVerletThermostat(pos, Lbox, vel,F,zeta,mass, dt,kbTemp,sigma,epsilon, Rcut, Q, nPart) #update positions and velocities using the velocity Verlet algorithm after first time step
+            pos = pos - Lbox * np.round(pos / Lbox)  # apply periodic boundary conditions
+            F = F_new
+           
+           
+            
+            if step % sample_freq == 0:
+                KE = kineticEnergy(vel, mass)  # calculate kinetic energy
+                P = pressure(pos, vel, mass, Lbox, Rcut, epsilon, sigma)  # calculate pressure
+                Upot = potentialEnergy(pos, Lbox, Rcut, epsilon, sigma)  # calculate potential energy
+                Tempi = temperature(KE, pos.shape[0], pos.shape[1])  # calculate temperature
+                print('%i %.12f %.12f %.12f %.12f' %(step, Tempi, KE, Upot, KE+Upot))
+                with open(log_file, 'a') as flog:
+                    flog.write(f"{step:6d} {Tempi:10.3f} {KE:12.5e} {Upot:12.5e} {Upot+KE:12.5e} {P:12.5e}\n") # write the data to the log file
+
+                write_frame(pos, Lbox, vel, F_new, traj_file, step)  # write the current frame to the trajectory file
+                                    
+                
+    return pos, vel, F  # return the final positions, velocities, and forces
+
 
 ############ INSERT YOUR FUNCTIONS HERE ##############
