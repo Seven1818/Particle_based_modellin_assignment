@@ -2,7 +2,7 @@
 
 import plotly.graph_objects as go
 import numpy as np
-import scipy as sc
+import scipy.constants as sc
 import math
 import re
 
